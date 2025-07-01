@@ -3,7 +3,7 @@ use std::{
     collections::HashSet,
     ffi::OsString,
     fs::{self, File},
-    io::{self, BufReader},
+    io::{BufReader, Read},
     path::{Path, PathBuf},
 };
 
@@ -44,9 +44,16 @@ fn format_path(path_like: &Path) -> String {
 }
 
 /// Compares the content of two files by size and then by SHA-256 hash.
-fn are_files_same(path1: &Path, path2: &Path) -> Result<bool> {
+fn are_files_same_with_reuse(
+    path1: &Path,
+    path2: &Path,
+    buffer: &mut [u8],
+    hasher1: &mut Sha256,
+    hasher2: &mut Sha256,
+) -> Result<bool> {
     let meta1 = fs::metadata(path1)?;
     let meta2 = fs::metadata(path2)?;
+
     if meta1.len() != meta2.len() {
         return Ok(false);
     }
@@ -54,18 +61,25 @@ fn are_files_same(path1: &Path, path2: &Path) -> Result<bool> {
         return Ok(true);
     }
 
-    let hash1 = {
-        let mut file = BufReader::new(File::open(path1)?);
-        let mut hasher = Sha256::new();
-        io::copy(&mut file, &mut hasher)?;
-        hasher.finalize()
-    };
-    let hash2 = {
-        let mut file = BufReader::new(File::open(path2)?);
-        let mut hasher = Sha256::new();
-        io::copy(&mut file, &mut hasher)?;
-        hasher.finalize()
-    };
+    // Hash file 1
+    hasher1.reset();
+    let mut file1 = BufReader::new(File::open(path1)?);
+    loop {
+        let read = file1.read(buffer)?;
+        if read == 0 { break; }
+        hasher1.update(&buffer[..read]);
+    }
+    let hash1 = hasher1.finalize_reset();
+
+    // Hash file 2
+    hasher2.reset();
+    let mut file2 = BufReader::new(File::open(path2)?);
+    loop {
+        let read = file2.read(buffer)?;
+        if read == 0 { break; }
+        hasher2.update(&buffer[..read]);
+    }
+    let hash2 = hasher2.finalize_reset();
 
     Ok(hash1 == hash2)
 }
@@ -146,7 +160,10 @@ fn compare_directories(
     let file_diffs: Vec<String> = files_to_compare
         .into_par_iter()
         .filter_map(|(p1, p2)| {
-            match are_files_same(&p1, &p2) {
+            let mut buffer = vec![0u8; 8192]; // 8KB shared buffer
+            let mut hasher1 = Sha256::new();
+            let mut hasher2 = Sha256::new();
+            match are_files_same_with_reuse(&p1, &p2, &mut buffer, &mut hasher1, &mut hasher2) {
                 Ok(true) => None,
                 Ok(false) => Some(format!("Files {} and {} differ", format_path(&p1), format_path(&p2))),
                 Err(e) => Some(format!("Error comparing {} and {}: {}", format_path(&p1), format_path(&p2), e)),
