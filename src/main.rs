@@ -33,16 +33,6 @@ impl EntryInfo {
     }
 }
 
-/// Formats a path or filename for output, adding quotes if it contains spaces.
-fn format_path(path_like: &Path) -> String {
-    let path_str = path_like.to_string_lossy();
-    if path_str.contains(' ') {
-        format!("\"{}\"", path_str)
-    } else {
-        path_str.into_owned()
-    }
-}
-
 /// Compares the content of two files by size and then by SHA-256 hash.
 fn are_files_same_with_reuse(
     path1: &Path,
@@ -188,7 +178,7 @@ fn compare_directories(
             match are_files_same_with_reuse(&p1, &p2, &mut buffer, &mut hasher1, &mut hasher2) {
                 Ok(true) => None,
                 Ok(false) => Some(format!("M:{}", p2.to_string_lossy())),
-                Err(e) => Some(format!("Error comparing {} and {}: {}", format_path(&p1), format_path(&p2), e)),
+                Err(e) => Some(format!("E:error comparing {} and {}: {}", p1.to_string_lossy(), p2.to_string_lossy(), e)),
             }
         })
         .collect();
@@ -199,7 +189,7 @@ fn compare_directories(
             // Pass the excludes set down in the recursive call.
             match compare_directories(&d1, &d2, excludes) {
                 Ok(diffs) => diffs,
-                Err(e) => vec![format!("Error comparing subdirectories {} and {}: {}", format_path(&d1), format_path(&d2), e)],
+                Err(e) => vec![format!("E:error comparing subdirectories {} and {}: {}", d1.to_string_lossy(), d2.to_string_lossy(), e)],
             }
         })
         .collect();
