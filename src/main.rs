@@ -126,7 +126,7 @@ fn compare_directories(
                 }
                 Ordering::Equal => {
                     if e1.is_dir != e2.is_dir {
-                        // Same name but the type is different
+                        // Same name but the type is different. Treat this as delete-and-add
                         if e1.is_dir {
                             differences.push(format!("D:{}/", e1.path.to_string_lossy()));
                         } else {
