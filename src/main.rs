@@ -27,7 +27,7 @@ impl EntryInfo {
         Ok(EntryInfo {
             path: entry.path(),
             file_name: entry.file_name(),
-            is_dir: metadata.is_dir(),
+            is_dir: entry.path().is_dir(),
             len: metadata.len(),
         })
     }
