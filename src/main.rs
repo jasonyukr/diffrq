@@ -119,19 +119,34 @@ fn compare_directories(
         match (entry1.as_ref(), entry2.as_ref()) {
             (Some(e1), Some(e2)) => match e1.file_name.cmp(&e2.file_name) {
                 Ordering::Less => {
-                    differences.push(format!("D:{}", e1.path.to_string_lossy()));
+                    if e1.is_dir {
+                        differences.push(format!("D:{}/", e1.path.to_string_lossy()));
+                    } else {
+                        differences.push(format!("D:{}", e1.path.to_string_lossy()));
+                    }
                     entry1 = iter1.next();
                 }
                 Ordering::Greater => {
-                    differences.push(format!("A:{}", e2.path.to_string_lossy()));
+                    if e2.is_dir {
+                        differences.push(format!("A:{}/", e2.path.to_string_lossy()));
+                    } else {
+                        differences.push(format!("A:{}", e2.path.to_string_lossy()));
+                    }
                     entry2 = iter2.next();
                 }
                 Ordering::Equal => {
                     if e1.is_dir != e2.is_dir {
                         // Same name but the type is different
-                        // differences.push(format!("X:{}", e2.path.to_string_lossy()));
-                        differences.push(format!("D:{}", e1.path.to_string_lossy()));
-                        differences.push(format!("A:{}", e2.path.to_string_lossy()));
+                        if e1.is_dir {
+                            differences.push(format!("D:{}/", e1.path.to_string_lossy()));
+                        } else {
+                            differences.push(format!("D:{}", e1.path.to_string_lossy()));
+                        }
+                        if e2.is_dir {
+                            differences.push(format!("A:{}/", e2.path.to_string_lossy()));
+                        } else {
+                            differences.push(format!("A:{}", e2.path.to_string_lossy()));
+                        }
                     } else if e1.is_dir {
                         dirs_to_compare.push((e1.path.clone(), e2.path.clone()));
                     } else if e1.len != e2.len {
@@ -144,11 +159,19 @@ fn compare_directories(
                 }
             },
             (Some(e1), None) => {
-                differences.push(format!("D:{}", e1.path.to_string_lossy()));
+                if e1.is_dir {
+                    differences.push(format!("D:{}/", e1.path.to_string_lossy()));
+                } else {
+                    differences.push(format!("D:{}", e1.path.to_string_lossy()));
+                }
                 entry1 = iter1.next();
             }
             (None, Some(e2)) => {
-                differences.push(format!("A:{}", e2.path.to_string_lossy()));
+                if e2.is_dir {
+                    differences.push(format!("A:{}/", e2.path.to_string_lossy()));
+                } else {
+                    differences.push(format!("A:{}", e2.path.to_string_lossy()));
+                }
                 entry2 = iter2.next();
             }
             (None, None) => break,
