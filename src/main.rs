@@ -119,24 +119,23 @@ fn compare_directories(
         match (entry1.as_ref(), entry2.as_ref()) {
             (Some(e1), Some(e2)) => match e1.file_name.cmp(&e2.file_name) {
                 Ordering::Less => {
-                    differences.push(format!("Only in {}: {}", format_path(dir1), format_path(Path::new(&e1.file_name))));
+                    differences.push(format!("D:{}", e1.path.to_string_lossy()));
                     entry1 = iter1.next();
                 }
                 Ordering::Greater => {
-                    differences.push(format!("Only in {}: {}", format_path(dir2), format_path(Path::new(&e2.file_name))));
+                    differences.push(format!("A:{}", e2.path.to_string_lossy()));
                     entry2 = iter2.next();
                 }
                 Ordering::Equal => {
                     if e1.is_dir != e2.is_dir {
-                        differences.push(format!(
-                            "File {} is a {} while file {} is a {}",
-                            format_path(&e1.path), if e1.is_dir { "directory" } else { "regular file" },
-                            format_path(&e2.path), if e2.is_dir { "directory" } else { "regular file" }
-                        ));
+                        // Same name but the type is different
+                        // differences.push(format!("X:{}", e2.path.to_string_lossy()));
+                        differences.push(format!("D:{}", e1.path.to_string_lossy()));
+                        differences.push(format!("A:{}", e2.path.to_string_lossy()));
                     } else if e1.is_dir {
                         dirs_to_compare.push((e1.path.clone(), e2.path.clone()));
                     } else if e1.len != e2.len {
-                        differences.push(format!("Files {} and {} differ", format_path(&e1.path), format_path(&e2.path)));
+                        differences.push(format!("M:{}", e2.path.to_string_lossy()));
                     } else {
                         files_to_compare.push((e1.path.clone(), e2.path.clone()));
                     }
@@ -145,11 +144,11 @@ fn compare_directories(
                 }
             },
             (Some(e1), None) => {
-                differences.push(format!("Only in {}: {}", format_path(dir1), format_path(Path::new(&e1.file_name))));
+                differences.push(format!("D:{}", e1.path.to_string_lossy()));
                 entry1 = iter1.next();
             }
             (None, Some(e2)) => {
-                differences.push(format!("Only in {}: {}", format_path(dir2), format_path(Path::new(&e2.file_name))));
+                differences.push(format!("A:{}", e2.path.to_string_lossy()));
                 entry2 = iter2.next();
             }
             (None, None) => break,
@@ -165,7 +164,7 @@ fn compare_directories(
             let mut hasher2 = Sha256::new();
             match are_files_same_with_reuse(&p1, &p2, &mut buffer, &mut hasher1, &mut hasher2) {
                 Ok(true) => None,
-                Ok(false) => Some(format!("Files {} and {} differ", format_path(&p1), format_path(&p2))),
+                Ok(false) => Some(format!("M:{}", p2.to_string_lossy())),
                 Err(e) => Some(format!("Error comparing {} and {}: {}", format_path(&p1), format_path(&p2), e)),
             }
         })
@@ -194,8 +193,11 @@ fn main() -> Result<()> {
     let mut dir2 = None;
     let mut excludes = HashSet::new();
 
+    let mut dir1_pathname = String::new();
+    let mut dir2_pathname = String::new();
+
     // Manual argument parsing
-    while let Some(arg) = args.next() {
+    while let Some(mut arg) = args.next() {
         if arg == "--exclude" {
             if let Some(pattern) = args.next() {
                 excludes.insert(OsString::from(pattern));
@@ -203,9 +205,14 @@ fn main() -> Result<()> {
                 anyhow::bail!("--exclude flag requires a value.");
             }
         } else if !arg.starts_with('-') {
+            if !arg.ends_with('/') {
+                arg.push('/')
+            }
             if dir1.is_none() {
+                dir1_pathname = arg.clone();
                 dir1 = Some(PathBuf::from(arg));
             } else if dir2.is_none() {
+                dir2_pathname = arg.clone();
                 dir2 = Some(PathBuf::from(arg));
             } else {
                 anyhow::bail!("Too many directory arguments specified.");
@@ -227,12 +234,25 @@ fn main() -> Result<()> {
     let differences = compare_directories(&dir1, &dir2, &excludes)
         .with_context(|| format!("Failed to compare directories '{}' and '{}'", dir1.display(), dir2.display()))?;
 
-    if differences.is_empty() {
-        std::process::exit(0);
-    } else {
+    if !differences.is_empty() {
         for diff in differences {
-            println!("{}", diff);
+            if diff.len() < 2 {
+                continue;
+            }
+            let slice: String = diff.chars().skip(2).collect();
+            if let Some(first_char) = diff.chars().next() {
+                if first_char.eq(&'M') {
+                    println!("M │\x1b[34m\u{25ae}\u{25ae}\x1b[0m│ \x1b[34m{}\x1b[0m", // modified: BLUE
+                        slice[dir2_pathname.len()..].to_string());
+                } else if first_char.eq(&'A') {
+                    println!("A │\x1b[32m\u{00a0}\u{25ae}\x1b[0m│ \x1b[32m{}\x1b[0m", // added: GREEN
+                        slice[dir2_pathname.len()..].to_string());
+                } else if first_char.eq(&'D') {
+                    println!("D │\x1b[31m\u{25ae}\u{00a0}\x1b[0m│ \x1b[31m{}\x1b[0m", // deleted: RED
+                        slice[dir1_pathname.len()..].to_string());
+                }
+            }
         }
-        std::process::exit(1);
     }
+    std::process::exit(0);
 }
