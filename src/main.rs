@@ -1,19 +1,18 @@
 use std::{
+    cell::RefCell,
     cmp::Ordering,
     collections::HashSet,
     ffi::OsString,
     fs::{self, File},
-    io::{BufReader, Read},
+    io::{self, BufReader, Read},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use anyhow::{Context, Result};
 use rayon::prelude::*;
-use sha2::{Digest, Sha256};
 
-/// A simple struct to hold necessary info from fs::DirEntry.
-/// Caching this info avoids redundant metadata() syscalls.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct EntryInfo {
     path: PathBuf,
     file_name: OsString,
@@ -24,7 +23,7 @@ struct EntryInfo {
 impl EntryInfo {
     fn from_dir_entry(entry: fs::DirEntry) -> Result<Self> {
         let metadata = entry.metadata()?;
-        Ok(EntryInfo {
+        Ok(Self {
             path: entry.path(),
             file_name: entry.file_name(),
             is_dir: entry.path().is_dir(),
@@ -33,171 +32,135 @@ impl EntryInfo {
     }
 }
 
-/// Compares the content of two files by size and then by SHA-256 hash.
-fn are_files_same_with_reuse(
-    path1: &Path,
-    path2: &Path,
-    buffer: &mut [u8],
-    hasher1: &mut Sha256,
-    hasher2: &mut Sha256,
-) -> Result<bool> {
-    let meta1 = fs::metadata(path1)?;
-    let meta2 = fs::metadata(path2)?;
-
-    if meta1.len() != meta2.len() {
-        return Ok(false);
-    }
-    if meta1.len() == 0 {
-        return Ok(true);
-    }
-
-    // Hash file 1
-    hasher1.reset();
-    let mut file1 = BufReader::new(File::open(path1)?);
-    loop {
-        let read = file1.read(buffer)?;
-        if read == 0 { break; }
-        hasher1.update(&buffer[..read]);
-    }
-    let hash1 = hasher1.finalize_reset();
-
-    // Hash file 2
-    hasher2.reset();
-    let mut file2 = BufReader::new(File::open(path2)?);
-    loop {
-        let read = file2.read(buffer)?;
-        if read == 0 { break; }
-        hasher2.update(&buffer[..read]);
-    }
-    let hash2 = hasher2.finalize_reset();
-
-    Ok(hash1 == hash2)
+thread_local! {
+    static THREAD_BUFFERS: RefCell<ThreadLocalBuffers> = RefCell::new(ThreadLocalBuffers::new());
 }
 
-/// Recursively compares two directories in parallel and returns a list of differences.
-fn compare_directories(
-    dir1: &Path,
-    dir2: &Path,
-    excludes: &HashSet<OsString>,
-) -> Result<Vec<String>> {
+struct ThreadLocalBuffers {
+    buffer1: Vec<u8>,
+    buffer2: Vec<u8>,
+}
+
+impl ThreadLocalBuffers {
+    fn new() -> Self {
+        Self {
+            buffer1: vec![0; 65536],
+            buffer2: vec![0; 65536],
+        }
+    }
+}
+
+fn files_are_identical(p1: &Path, p2: &Path) -> io::Result<bool> {
+    let mut f1 = BufReader::new(File::open(p1)?);
+    let mut f2 = BufReader::new(File::open(p2)?);
+
+    THREAD_BUFFERS.with(|res| {
+        let mut buffers = res.borrow_mut();
+        let ThreadLocalBuffers { buffer1, buffer2 } = &mut *buffers;
+
+        loop {
+            let b1 = f1.read(buffer1)?;
+            let b2 = f2.read(buffer2)?;
+            if b1 != b2 || buffer1[..b1] != buffer2[..b2] {
+                return Ok(false);
+            }
+            if b1 == 0 {
+                return Ok(true);
+            }
+        }
+    })
+}
+
+fn compare_directories<F>(dir1: &Path, dir2: &Path, excludes: &HashSet<OsString>, report: &F) -> Result<()>
+where
+    F: Fn(&str) + Sync,
+{
     let read_entries = |dir: &Path| -> Result<Vec<EntryInfo>> {
         fs::read_dir(dir)?
-            .filter_map(|res| res.ok())
-            // The core exclusion logic: filter out any entry whose name is in the excludes set.
+            .filter_map(Result::ok)
             .filter(|entry| !excludes.contains(&entry.file_name()))
             .map(EntryInfo::from_dir_entry)
-            .collect::<Result<Vec<_>>>()
+            .collect()
     };
 
-    let mut entries1 = read_entries(dir1)?;
-    let mut entries2 = read_entries(dir2)?;
+    let (entries1, entries2) = rayon::join(|| read_entries(dir1), || read_entries(dir2));
+    let mut entries1 = entries1?;
+    let mut entries2 = entries2?;
 
     entries1.sort_by(|a, b| a.file_name.cmp(&b.file_name));
     entries2.sort_by(|a, b| a.file_name.cmp(&b.file_name));
 
-    let mut differences = Vec::new();
-    let mut files_to_compare = Vec::new();
-    let mut dirs_to_compare = Vec::new();
+    let mut files_to_compare = vec![];
+    let mut dirs_to_compare = vec![];
 
-    let mut iter1 = entries1.into_iter();
-    let mut iter2 = entries2.into_iter();
-    let mut entry1 = iter1.next();
-    let mut entry2 = iter2.next();
+    let mut i1 = entries1.into_iter();
+    let mut i2 = entries2.into_iter();
+    let mut e1 = i1.next();
+    let mut e2 = i2.next();
 
-    // Two-pointer comparison algorithm
-    loop {
-        match (entry1.as_ref(), entry2.as_ref()) {
-            (Some(e1), Some(e2)) => match e1.file_name.cmp(&e2.file_name) {
+    while e1.is_some() || e2.is_some() {
+        match (e1.as_ref(), e2.as_ref()) {
+            (Some(a), Some(b)) => match a.file_name.cmp(&b.file_name) {
                 Ordering::Less => {
-                    if e1.is_dir {
-                        differences.push(format!("D:{}/", e1.path.to_string_lossy()));
-                    } else {
-                        differences.push(format!("D:{}", e1.path.to_string_lossy()));
-                    }
-                    entry1 = iter1.next();
+                    report(&format!("D:{}", a.path.to_string_lossy()));
+                    e1 = i1.next();
                 }
                 Ordering::Greater => {
-                    if e2.is_dir {
-                        differences.push(format!("A:{}/", e2.path.to_string_lossy()));
-                    } else {
-                        differences.push(format!("A:{}", e2.path.to_string_lossy()));
-                    }
-                    entry2 = iter2.next();
+                    report(&format!("A:{}", b.path.to_string_lossy()));
+                    e2 = i2.next();
                 }
                 Ordering::Equal => {
-                    if e1.is_dir != e2.is_dir {
-                        // Same name but the type is different. Treat this as delete-and-add
-                        if e1.is_dir {
-                            differences.push(format!("D:{}/", e1.path.to_string_lossy()));
-                        } else {
-                            differences.push(format!("D:{}", e1.path.to_string_lossy()));
-                        }
-                        if e2.is_dir {
-                            differences.push(format!("A:{}/", e2.path.to_string_lossy()));
-                        } else {
-                            differences.push(format!("A:{}", e2.path.to_string_lossy()));
-                        }
-                    } else if e1.is_dir {
-                        dirs_to_compare.push((e1.path.clone(), e2.path.clone()));
-                    } else if e1.len != e2.len {
-                        differences.push(format!("M:{}", e2.path.to_string_lossy()));
-                    } else {
-                        files_to_compare.push((e1.path.clone(), e2.path.clone()));
+                    if a.is_dir != b.is_dir {
+                        report(&format!("D:{}", a.path.to_string_lossy()));
+                        report(&format!("A:{}", b.path.to_string_lossy()));
+                    } else if a.is_dir {
+                        dirs_to_compare.push((a.path.clone(), b.path.clone()));
+                    } else if a.len != b.len {
+                        report(&format!("M:{}", b.path.to_string_lossy()));
+                    } else if a.len > 0 {
+                        files_to_compare.push((a.path.clone(), b.path.clone()));
                     }
-                    entry1 = iter1.next();
-                    entry2 = iter2.next();
+                    e1 = i1.next();
+                    e2 = i2.next();
                 }
             },
-            (Some(e1), None) => {
-                if e1.is_dir {
-                    differences.push(format!("D:{}/", e1.path.to_string_lossy()));
-                } else {
-                    differences.push(format!("D:{}", e1.path.to_string_lossy()));
-                }
-                entry1 = iter1.next();
+            (Some(a), None) => {
+                report(&format!("D:{}", a.path.to_string_lossy()));
+                e1 = i1.next();
             }
-            (None, Some(e2)) => {
-                if e2.is_dir {
-                    differences.push(format!("A:{}/", e2.path.to_string_lossy()));
-                } else {
-                    differences.push(format!("A:{}", e2.path.to_string_lossy()));
-                }
-                entry2 = iter2.next();
+            (None, Some(b)) => {
+                report(&format!("A:{}", b.path.to_string_lossy()));
+                e2 = i2.next();
             }
-            (None, None) => break,
+            _ => break,
         }
     }
 
-    // === PARALLEL PROCESSING ===
-    let file_diffs: Vec<String> = files_to_compare
-        .into_par_iter()
-        .filter_map(|(p1, p2)| {
-            let mut buffer = vec![0u8; 8192]; // 8KB shared buffer
-            let mut hasher1 = Sha256::new();
-            let mut hasher2 = Sha256::new();
-            match are_files_same_with_reuse(&p1, &p2, &mut buffer, &mut hasher1, &mut hasher2) {
-                Ok(true) => None,
-                Ok(false) => Some(format!("M:{}", p2.to_string_lossy())),
-                Err(e) => Some(format!("E:error comparing {} and {}: {}", p1.to_string_lossy(), p2.to_string_lossy(), e)),
-            }
-        })
-        .collect();
+    files_to_compare.into_par_iter().for_each(|(p1, p2)| {
+        match files_are_identical(&p1, &p2) {
+            Ok(false) => report(&format!("M:{}", p2.to_string_lossy())),
+            Err(e) => report(&format!(
+                "E:Failed to compare '{}' and '{}': {}",
+                p1.display(),
+                p2.display(),
+                e
+            )),
+            _ => {}
+        }
+    });
 
-    let dir_diffs: Vec<String> = dirs_to_compare
-        .into_par_iter()
-        .flat_map(|(d1, d2)| {
-            // Pass the excludes set down in the recursive call.
-            match compare_directories(&d1, &d2, excludes) {
-                Ok(diffs) => diffs,
-                Err(e) => vec![format!("E:error comparing subdirectories {} and {}: {}", d1.to_string_lossy(), d2.to_string_lossy(), e)],
-            }
-        })
-        .collect();
+    dirs_to_compare.into_par_iter().for_each(|(d1, d2)| {
+        if let Err(e) = compare_directories(&d1, &d2, excludes, report) {
+            report(&format!(
+                "E:error comparing subdirectories {} and {}: {}",
+                d1.display(),
+                d2.display(),
+                e
+            ));
+        }
+    });
 
-    differences.extend(file_diffs);
-    differences.extend(dir_diffs);
-
-    Ok(differences)
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -206,66 +169,65 @@ fn main() -> Result<()> {
     let mut dir2 = None;
     let mut excludes = HashSet::new();
 
-    let mut dir1_pathname = String::new();
-    let mut dir2_pathname = String::new();
-
-    // Manual argument parsing
-    while let Some(mut arg) = args.next() {
+    while let Some(arg) = args.next() {
         if arg == "--exclude" {
-            if let Some(pattern) = args.next() {
-                excludes.insert(OsString::from(pattern));
+            if let Some(value) = args.next() {
+                excludes.insert(OsString::from(value));
             } else {
-                anyhow::bail!("--exclude flag requires a value.");
+                anyhow::bail!("Missing value after --exclude");
             }
         } else if !arg.starts_with('-') {
-            if !arg.ends_with('/') {
-                arg.push('/')
-            }
             if dir1.is_none() {
-                dir1_pathname = arg.clone();
                 dir1 = Some(PathBuf::from(arg));
             } else if dir2.is_none() {
-                dir2_pathname = arg.clone();
                 dir2 = Some(PathBuf::from(arg));
             } else {
-                anyhow::bail!("Too many directory arguments specified.");
+                anyhow::bail!("Too many positional arguments");
             }
         } else {
-            anyhow::bail!("Unknown flag or option: {}", arg);
+            anyhow::bail!("Unknown flag: {}", arg);
         }
     }
 
-    let dir1 = dir1.context("Missing required argument: <directory1>")?;
-    let dir2 = dir2.context("Missing required argument: <directory2>")?;
+    let dir1 = dir1.context("Missing <directory1>")?;
+    let dir2 = dir2.context("Missing <directory2>")?;
 
-    for (name, path) in [("directory1", &dir1), ("directory2", &dir2)] {
+    for (label, path) in [("directory1", &dir1), ("directory2", &dir2)] {
         if !path.is_dir() {
-            return Err(anyhow::anyhow!("Input path for {} is not a valid directory: {}", name, path.display()));
+            anyhow::bail!("{} is not a directory: {}", label, path.display());
         }
     }
 
-    let differences = compare_directories(&dir1, &dir2, &excludes)
-        .with_context(|| format!("Failed to compare directories '{}' and '{}'", dir1.display(), dir2.display()))?;
+    let dir1_prefix = dir1.canonicalize()?.join("");
+    let dir2_prefix = dir2.canonicalize()?.join("");
 
-    if !differences.is_empty() {
-        for diff in differences {
-            if diff.len() < 2 {
-                continue;
-            }
-            let slice: String = diff.chars().skip(2).collect();
-            if let Some(first_char) = diff.chars().next() {
-                if first_char.eq(&'M') {
-                    println!("M │\x1b[34m\u{25ae}\u{25ae}\x1b[0m│ \x1b[34m{}\x1b[0m", // modified: BLUE
-                        slice[dir2_pathname.len()..].to_string());
-                } else if first_char.eq(&'A') {
-                    println!("A │\x1b[32m\u{00a0}\u{25ae}\x1b[0m│ \x1b[32m{}\x1b[0m", // added: GREEN
-                        slice[dir2_pathname.len()..].to_string());
-                } else if first_char.eq(&'D') {
-                    println!("D │\x1b[31m\u{25ae}\u{00a0}\x1b[0m│ \x1b[31m{}\x1b[0m", // deleted: RED
-                        slice[dir1_pathname.len()..].to_string());
-                }
+    let report_fn = Arc::new(move |line: &str| {
+        if let Some((tag, raw_path)) = line.split_once(':') {
+            let full_path = Path::new(raw_path);
+            let reduced = match tag {
+                "M" | "A" => full_path.strip_prefix(&dir2_prefix).unwrap_or(full_path),
+                "D"       => full_path.strip_prefix(&dir1_prefix).unwrap_or(full_path),
+                _         => full_path,
+            };
+
+            let is_dir = full_path.is_dir();
+            let path_str = reduced.to_string_lossy();
+            let display_path = format!("{path_str}{}", if is_dir { "/" } else { "" });
+
+            match tag {
+                "M" => println!("M │\x1b[34m\u{25ae}\u{25ae}\x1b[0m│ \x1b[34m{display_path}\x1b[0m"),
+                "A" => println!("A │\x1b[32m\u{00a0}\u{25ae}\x1b[0m│ \x1b[32m{display_path}\x1b[0m"),
+                "D" => println!("D │\x1b[31m\u{25ae}\u{00a0}\x1b[0m│ \x1b[31m{display_path}\x1b[0m"),
+                "E" => eprintln!("\x1b[91mError: {display_path}\x1b[0m"),
+                _ => {}
             }
         }
-    }
-    std::process::exit(0);
+    });
+
+    // Wrap in `move` closure that dereferences Arc
+    let reporter = move |line: &str| report_fn(line);
+    compare_directories(&dir1, &dir2, &excludes, &reporter)?;
+
+    Ok(())
 }
+
