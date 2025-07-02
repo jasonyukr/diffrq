@@ -10,7 +10,6 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use rayon::prelude::*;
 
 #[derive(Debug, Clone)]
 struct EntryInfo {
@@ -44,8 +43,8 @@ struct ThreadLocalBuffers {
 impl ThreadLocalBuffers {
     fn new() -> Self {
         Self {
-            buffer1: vec![0; 65536],
-            buffer2: vec![0; 65536],
+            buffer1: vec![0; 131072],
+            buffer2: vec![0; 131072],
         }
     }
 }
@@ -73,7 +72,7 @@ fn files_are_identical(p1: &Path, p2: &Path) -> io::Result<bool> {
 
 fn compare_directories<F>(dir1: &Path, dir2: &Path, excludes: &HashSet<OsString>, report: &F) -> Result<()>
 where
-    F: Fn(&str) + Sync,
+    F: Fn(&str),
 {
     let read_entries = |dir: &Path| -> Result<Vec<EntryInfo>> {
         fs::read_dir(dir)?
@@ -83,9 +82,8 @@ where
             .collect()
     };
 
-    let (entries1, entries2) = rayon::join(|| read_entries(dir1), || read_entries(dir2));
-    let mut entries1 = entries1?;
-    let mut entries2 = entries2?;
+    let mut entries1 = read_entries(dir1)?;
+    let mut entries2 = read_entries(dir2)?;
 
     entries1.sort_by(|a, b| a.file_name.cmp(&b.file_name));
     entries2.sort_by(|a, b| a.file_name.cmp(&b.file_name));
@@ -136,7 +134,7 @@ where
         }
     }
 
-    files_to_compare.into_par_iter().for_each(|(p1, p2)| {
+    for (p1, p2) in files_to_compare {
         match files_are_identical(&p1, &p2) {
             Ok(false) => report(&format!("M:{}", p2.to_string_lossy())),
             Err(e) => report(&format!(
@@ -147,9 +145,9 @@ where
             )),
             _ => {}
         }
-    });
+    }
 
-    dirs_to_compare.into_par_iter().for_each(|(d1, d2)| {
+    for (d1, d2) in dirs_to_compare {
         if let Err(e) = compare_directories(&d1, &d2, excludes, report) {
             report(&format!(
                 "E:error comparing subdirectories {} and {}: {}",
@@ -158,7 +156,7 @@ where
                 e
             ));
         }
-    });
+    }
 
     Ok(())
 }
@@ -224,7 +222,6 @@ fn main() -> Result<()> {
         }
     });
 
-    // Wrap in `move` closure that dereferences Arc
     let reporter = move |line: &str| report_fn(line);
     compare_directories(&dir1, &dir2, &excludes, &reporter)?;
 
