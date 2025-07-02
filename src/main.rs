@@ -6,7 +6,6 @@ use std::{
     fs::{self, File},
     io::{self, BufReader, Read},
     path::{Path, PathBuf},
-    sync::Arc,
 };
 
 use anyhow::{Context, Result};
@@ -25,7 +24,7 @@ impl EntryInfo {
         Ok(Self {
             path: entry.path(),
             file_name: entry.file_name(),
-            is_dir: entry.path().is_dir(),
+            is_dir: metadata.is_dir(), // entry.path().is_dir() ???
             len: metadata.len(),
         })
     }
@@ -43,7 +42,7 @@ struct ThreadLocalBuffers {
 impl ThreadLocalBuffers {
     fn new() -> Self {
         Self {
-            buffer1: vec![0; 131072],
+            buffer1: vec![0; 131072], // 128 KB
             buffer2: vec![0; 131072],
         }
     }
@@ -196,16 +195,16 @@ fn main() -> Result<()> {
         }
     }
 
-    let dir1_prefix = dir1.canonicalize()?.join("");
-    let dir2_prefix = dir2.canonicalize()?.join("");
+    let dir1_ref = dir1.as_path();
+    let dir2_ref = dir2.as_path();
 
-    let report_fn = Arc::new(move |line: &str| {
+    let report_fn = |line: &str| {
         if let Some((tag, raw_path)) = line.split_once(':') {
             let full_path = Path::new(raw_path);
             let reduced = match tag {
-                "M" | "A" => full_path.strip_prefix(&dir2_prefix).unwrap_or(full_path),
-                "D"       => full_path.strip_prefix(&dir1_prefix).unwrap_or(full_path),
-                _         => full_path,
+                "M" | "A" => full_path.strip_prefix(dir2_ref).unwrap_or(full_path),
+                "D" => full_path.strip_prefix(dir1_ref).unwrap_or(full_path),
+                _ => full_path,
             };
 
             let is_dir = full_path.is_dir();
@@ -213,17 +212,16 @@ fn main() -> Result<()> {
             let display_path = format!("{path_str}{}", if is_dir { "/" } else { "" });
 
             match tag {
-                "M" => println!("M │\x1b[34m\u{25ae}\u{25ae}\x1b[0m│ \x1b[34m{display_path}\x1b[0m"),
-                "A" => println!("A │\x1b[32m\u{00a0}\u{25ae}\x1b[0m│ \x1b[32m{display_path}\x1b[0m"),
-                "D" => println!("D │\x1b[31m\u{25ae}\u{00a0}\x1b[0m│ \x1b[31m{display_path}\x1b[0m"),
+                "M" => println!("M │\x1b[34m▮▮\x1b[0m│ \x1b[34m{display_path}\x1b[0m"),
+                "A" => println!("A │\x1b[32m ▮\x1b[0m│ \x1b[32m{display_path}\x1b[0m"),
+                "D" => println!("D │\x1b[31m▮ \x1b[0m│ \x1b[31m{display_path}\x1b[0m"),
                 "E" => eprintln!("\x1b[91mError: {display_path}\x1b[0m"),
                 _ => {}
             }
         }
-    });
+    };
 
-    let reporter = move |line: &str| report_fn(line);
-    compare_directories(&dir1, &dir2, &excludes, &reporter)?;
+    compare_directories(dir1_ref, dir2_ref, &excludes, &report_fn)?;
 
     Ok(())
 }
