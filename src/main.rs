@@ -69,7 +69,7 @@ fn files_are_identical(p1: &Path, p2: &Path) -> io::Result<bool> {
     })
 }
 
-fn compare_directories<F>(dir1: &Path, dir2: &Path, excludes: &HashSet<OsString>, report: &F) -> Result<()>
+fn compare_directories<F>(dir1: &Path, dir2: &Path, excludes: &HashSet<OsString>, all_mode: bool, report: &F) -> Result<()>
 where
     F: Fn(&str),
 {
@@ -136,18 +136,18 @@ where
     for (p1, p2) in files_to_compare {
         match files_are_identical(&p1, &p2) {
             Ok(false) => report(&format!("M:{}", p2.to_string_lossy())),
+            Ok(true) => if all_mode { report(&format!("-:{}", p2.to_string_lossy())) },
             Err(e) => report(&format!(
                 "E:Failed to compare '{}' and '{}': {}",
                 p1.display(),
                 p2.display(),
                 e
             )),
-            _ => {}
         }
     }
 
     for (d1, d2) in dirs_to_compare {
-        if let Err(e) = compare_directories(&d1, &d2, excludes, report) {
+        if let Err(e) = compare_directories(&d1, &d2, excludes, all_mode, report) {
             report(&format!(
                 "E:error comparing subdirectories {} and {}: {}",
                 d1.display(),
@@ -161,13 +161,19 @@ where
 }
 
 fn main() -> Result<()> {
+    let mut all_mode = false;
+    let mut noformat_mode = false;
     let mut args = std::env::args().skip(1);
     let mut dir1 = None;
     let mut dir2 = None;
     let mut excludes = HashSet::new();
 
     while let Some(arg) = args.next() {
-        if arg == "--exclude" {
+        if arg == "--all" {
+            all_mode = true;
+        } else if arg == "--noformat" {
+            noformat_mode = true;
+        } else if arg == "--exclude" {
             if let Some(value) = args.next() {
                 excludes.insert(OsString::from(value));
             } else {
@@ -202,7 +208,7 @@ fn main() -> Result<()> {
         if let Some((tag, raw_path)) = line.split_once(':') {
             let full_path = Path::new(raw_path);
             let reduced = match tag {
-                "M" | "A" => full_path.strip_prefix(dir2_ref).unwrap_or(full_path),
+                "M" | "A" | "-" => full_path.strip_prefix(dir2_ref).unwrap_or(full_path),
                 "D" => full_path.strip_prefix(dir1_ref).unwrap_or(full_path),
                 _ => full_path,
             };
@@ -211,17 +217,29 @@ fn main() -> Result<()> {
             let path_str = reduced.to_string_lossy();
             let display_path = format!("{path_str}{}", if is_dir { "/" } else { "" });
 
-            match tag {
-                "M" => println!("M │\x1b[34m▮▮\x1b[0m│ \x1b[34m{display_path}\x1b[0m"),
-                "A" => println!("A │\x1b[32m ▮\x1b[0m│ \x1b[32m{display_path}\x1b[0m"),
-                "D" => println!("D │\x1b[31m▮ \x1b[0m│ \x1b[31m{display_path}\x1b[0m"),
-                "E" => eprintln!("\x1b[91mError: {display_path}\x1b[0m"),
-                _ => {}
+            if noformat_mode {
+                match tag {
+                    "M" => println!("M: {display_path}"),
+                    "A" => println!("A: {display_path}"),
+                    "D" => println!("D: {display_path}"),
+                    "-" => println!("-: {display_path}"),
+                    "E" => eprintln!("Error: {display_path}"),
+                    _ => {}
+                }
+            } else {
+                match tag {
+                    "M" => println!("M │\x1b[34m▮▮\x1b[0m│ \x1b[34m{display_path}\x1b[0m"),
+                    "A" => println!("A │\x1b[32m ▮\x1b[0m│ \x1b[32m{display_path}\x1b[0m"),
+                    "D" => println!("D │\x1b[31m▮ \x1b[0m│ \x1b[31m{display_path}\x1b[0m"),
+                    "-" => println!("- │▮▮│ {display_path}"),
+                    "E" => eprintln!("\x1b[91mError: {display_path}\x1b[0m"),
+                    _ => {}
+                }
             }
         }
     };
 
-    compare_directories(dir1_ref, dir2_ref, &excludes, &report_fn)?;
+    compare_directories(dir1_ref, dir2_ref, &excludes, all_mode, &report_fn)?;
 
     Ok(())
 }
