@@ -115,7 +115,23 @@ where
                     } else if a.len != b.len {
                         report(&format!("M:{}", b.path.to_string_lossy()));
                     } else if a.len > 0 {
-                        files_to_compare.push((a.path.clone(), b.path.clone()));
+                        if all_mode {
+                            // report immediately in "--all-mode" to keep the order of files
+                            let p1 = &a.path.clone();
+                            let p2 = &b.path.clone();
+                            match files_are_identical(&p1, &p2) {
+                                Ok(false) => report(&format!("M:{}", p2.to_string_lossy())),
+                                Ok(true) => if all_mode { report(&format!("-:{}", p2.to_string_lossy())) },
+                                Err(e) => report(&format!(
+                                        "E:Failed to compare '{}' and '{}': {}",
+                                        p1.display(),
+                                        p2.display(),
+                                        e
+                                )),
+                            }
+                        } else {
+                            files_to_compare.push((a.path.clone(), b.path.clone()));
+                        }
                     }
                     e1 = i1.next();
                     e2 = i2.next();
